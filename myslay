@@ -1,0 +1,164 @@
+#!/usr/bin/perl
+
+use strict;
+use DBI;
+use Data::Dumper;
+use Getopt::Std;
+use Time::HiRes qw (sleep);
+use vars qw/ %opts /;
+our $opts;
+my $debug = 0;
+my $socket = '/var/run/mysqld/mysqld.sock';
+my $interval = 1;
+my $max_time = 0;
+my $casematch = 1;
+
+sub logger
+{
+	my $level = shift;
+	my @args = @_;
+	my $message = join("", @args);
+	print(STDERR "$message\n");
+}
+
+sub log_fatal
+{
+	my $msg = shift;
+	logger("crit", $msg);
+	exit(1);
+}
+
+sub killit
+{
+	my ($dbh, $r) = @_;
+	if ($debug == 0) {
+		$dbh->do("kill $r->{'Id'}") or do {
+			if ($dbh->err != 1094) {
+				print("$r->{'Id'} could not be killed: " . $dbh->err . "\n");
+			}
+		};
+	} else {
+		print("killing:\n");
+		for my $f (keys %{$r}) {
+			print("  $f=" . $r->{$f} . "\n");
+		}
+	}
+}
+
+sub slay
+{
+	my ($dbh, $pattern) = @_;
+
+	my $q = "show full processlist;";
+
+	while (1) {
+		my $qh = $dbh->prepare($q) || do {
+			log_trap_error("failed to prepare query($q): " . $dbh->errstr);
+			$dbh->disconnect();
+			return;
+		};
+
+		$qh->execute() || do {
+			log_trap_error("failed to execute query($q): " . $qh->errstr);
+			$qh->finish();
+			$dbh->disconnect();
+			return;
+		};
+
+		my $querycount = 0;
+		while (my $r = $qh->fetchrow_hashref()) {
+			next if !defined($r->{'Info'});
+			my $query = $r->{'Info'};
+			$query =~ s/[\s]+/ /g;
+			my $match = 0;
+
+			if ($casematch == 1) {
+				$match = 1 if ($query =~ /$pattern/);
+			} else {
+				$match = 1 if ($query =~ /$pattern/i);
+			}
+
+			if ($match > 0) {
+				if ($max_time > 0) {
+					if (defined($r->{'Time'})
+						&& $r->{'Time'} >= $max_time) {
+						killit($dbh, $r);
+						$querycount++;
+					}
+				} else {
+					killit($dbh, $r);
+					$querycount++;
+				}
+			}
+		}
+		$qh->finish();
+		print("Killed $querycount, Sleeping $interval second\n");
+		sleep($interval);
+	}
+}
+
+sub usage
+{
+	print("Usage: myslay [-dhS] <pattern>\n");
+	print("\t-d\tdebug (prints errors to STDERR, stays in foreground)\n");
+	print("\t-h\tprints this help\n");
+	print("\t-S\tsocket path\n");
+	print("\t-s\tSleep interval in seconds\n");
+	print("\t-i\tMatch case-insensitive\n");
+	print("\t-t\tKill all queries with a run time greater or equal this value\n");
+}
+
+sub main
+{
+	getopts("dhS:s:t:i", \%opts) or do {
+		usage();
+		exit(1);
+	};
+
+	if (defined($opts{'h'})) {
+		usage();
+		exit(0);
+	}
+
+	if (defined($opts{'d'})) {
+		$debug = 1;
+	}
+
+	if (defined($opts{'S'})) {
+		$socket = $opts{'S'};
+	}
+
+	if (defined($opts{'s'})) {
+		$interval = $opts{'s'};
+	}
+
+	if (defined($opts{'i'})) {
+		$casematch = 0;
+	}
+
+	if (defined($opts{'t'})) {
+		$max_time = $opts{'t'};
+		$max_time = 0 if ($max_time < 0);
+	}
+
+	my $dsn = "DBI:mysql:mysql_connect_timeout=3;mysql_socket=$socket;mysql_read_default_file=/root/.my.cnf;mysql_read_default_group=client";
+	my $dbh = DBI->connect($dsn) || do {
+		log_trap_error("could not connect to MySQL [$dsn]: " . $DBI::errstr);
+		return;
+	};
+	$dbh->{'mysql_auto_reconnect'} = 1;
+	$dbh->{'PrintError'} = 0;
+
+	my $pattern = shift @ARGV;
+	if ($pattern =~ /^[\s]*$/) {
+		logger("err", "no pattern specified");
+		exit(1);
+	}
+
+	slay($dbh, $pattern);
+
+	$dbh->disconnect();
+}
+
+main();
+exit(0);
